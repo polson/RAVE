@@ -15,5 +15,6 @@ cached-conv>=2.5.0
 nn-tilde>=1.5.2
 torchaudio
 tensorboard
+wandb
 pytest>=7.2.2
 Flask>=2.2.3

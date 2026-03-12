@@ -494,22 +494,69 @@ class RAVE(pl.LightningModule):
         y = torch.cat(audio, 0)[:8].reshape(-1).numpy()
         if self.integrator is not None:
             y = self.integrator(y)
-        self.logger.experiment.add_audio("audio_val", y, self.eval_number,
-                                        self.sr)
+        self._log_audio("audio_val", y, self.eval_number, self.sr)
         self.eval_number += 1
         self.validation_step_outputs.clear()
 
-    def on_fit_start(self):
-        tb = self.logger.experiment
+    def _log_audio(self, name: str, audio: np.ndarray, step: int,
+                   sample_rate: int) -> None:
+        if self.logger is None:
+            return
 
+        experiment = self.logger.experiment
+
+        if hasattr(experiment, "add_audio"):
+            experiment.add_audio(name, audio, step, sample_rate)
+            return
+
+        if hasattr(experiment, "log"):
+            try:
+                import wandb
+
+                experiment.log(
+                    {
+                        name:
+                        wandb.Audio(audio,
+                                    sample_rate=sample_rate,
+                                    caption=f"{name}_{step}"),
+                    },
+                    step=step,
+                )
+            except Exception:
+                pass
+
+    def _log_text(self, name: str, text: str, step: int = 0) -> None:
+        if self.logger is None:
+            return
+
+        experiment = self.logger.experiment
+
+        if hasattr(experiment, "add_text"):
+            experiment.add_text(name, text)
+            return
+
+        if hasattr(experiment, "log"):
+            try:
+                import wandb
+
+                experiment.log(
+                    {
+                        name: wandb.Html(f"<pre>{text}</pre>"),
+                    },
+                    step=step,
+                )
+            except Exception:
+                pass
+
+    def on_fit_start(self):
         config = gin.operative_config_str()
         config = config.split('\n')
         config = ['```'] + config + ['```']
         config = '\n'.join(config)
-        tb.add_text("config", config)
+        self._log_text("config", config, self.global_step)
 
         model = str(self)
         model = model.split('\n')
         model = ['```'] + model + ['```']
         model = '\n'.join(model)
-        tb.add_text("model", model)
+        self._log_text("model", model, self.global_step)

@@ -87,6 +87,18 @@ flags.DEFINE_bool('progress',
 flags.DEFINE_bool('smoke_test', 
                   default=False,
                   help="Run training with n_batches=1 to test the model")
+flags.DEFINE_bool('wandb',
+                  default=False,
+                  help='Enable Weights & Biases logging')
+flags.DEFINE_string('wandb_project',
+                    default='rave',
+                    help='W&B project name')
+flags.DEFINE_string('wandb_entity',
+                    default=None,
+                    help='Optional W&B entity/team')
+flags.DEFINE_bool('wandb_save_code',
+                  default=True,
+                  help='Save code to W&B')
 
 
 class EMA(pl.Callback):
@@ -179,6 +191,30 @@ def infer_musdb_channels(split_root: str, stem_filename: str, target_channels: i
         f"[Warning] could not infer channels from {split_root} with stem '{stem_filename}', taking 1 by default"
     )
     return 1
+
+
+def get_logger(run_name: str):
+    if FLAGS.wandb:
+        logger = pl.loggers.WandbLogger(
+            name=run_name,
+            project=FLAGS.wandb_project,
+            entity=FLAGS.wandb_entity,
+            save_dir=FLAGS.out_path,
+            log_model=False,
+        )
+
+        if FLAGS.wandb_save_code:
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            if not os.path.isdir(repo_root):
+                repo_root = os.getcwd()
+            logger.experiment.log_code(root=repo_root)
+
+        return logger
+
+    return pl.loggers.TensorBoardLogger(
+        FLAGS.out_path,
+        name=run_name,
+    )
 
 def main(argv):
     torch.set_float32_matmul_precision('high')
@@ -311,10 +347,7 @@ def main(argv):
         callbacks.append(EMA(FLAGS.ema))
 
     trainer = pl.Trainer(
-        logger=pl.loggers.TensorBoardLogger(
-            FLAGS.out_path,
-            name=RUN_NAME,
-        ),
+        logger=get_logger(RUN_NAME),
         accelerator=accelerator,
         devices=devices,
         callbacks=callbacks,
