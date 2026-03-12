@@ -18,3 +18,4 @@ tensorboard
 wandb
 pytest>=7.2.2
 Flask>=2.2.3
+musicsep-visualizer @ git+https://github.com/polson/musicsep-visualizer.git

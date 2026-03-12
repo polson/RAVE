@@ -1,11 +1,12 @@
 import hashlib
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import gin
 import lightning.pytorch as pl
 import torch
+import torch.nn.functional as F
 import torchaudio
 from absl import flags, app
 from torch.utils.data import DataLoader
@@ -99,6 +100,11 @@ flags.DEFINE_string('wandb_entity',
 flags.DEFINE_bool('wandb_save_code',
                   default=True,
                   help='Save code to W&B')
+flags.DEFINE_integer(
+    'debug_every',
+    0,
+    help='Run MUSDB debug visualization every N train steps (0 disables)',
+)
 
 
 class EMA(pl.Callback):
@@ -141,6 +147,112 @@ class EMA(pl.Callback):
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         self.weights.update(state_dict)
+
+
+class MusdbDebugVisualizerCallback(pl.Callback):
+
+    DEBUG_SECONDS = 3.0
+
+    def __init__(self, debug_every: int, fallback_val_loader: Optional[DataLoader] = None) -> None:
+        super().__init__()
+        self.debug_every = debug_every
+        self._fallback_val_loader = fallback_val_loader
+        self._cached_sample: Optional[torch.Tensor] = None
+        self._viz_hook = None
+        self._viz_class = None
+
+    @staticmethod
+    def _extract_tensor(sample):
+        if isinstance(sample, torch.Tensor):
+            return sample
+        return torch.as_tensor(sample)
+
+    @staticmethod
+    def _resolve_single_dataloader(dataloaders):
+        if isinstance(dataloaders, (list, tuple)):
+            if not dataloaders:
+                return None
+            return dataloaders[0]
+        return dataloaders
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        device = getattr(getattr(trainer, 'strategy', None), 'root_device', pl_module.device)
+        if device.type != 'cuda':
+            raise RuntimeError(
+                'MUSDB debug visualizer requires CUDA tensors. '
+                'Run training on CUDA or disable --debug_every.'
+            )
+
+        val_loader = self._resolve_single_dataloader(getattr(trainer, 'val_dataloaders', None))
+        if val_loader is None:
+            val_loader = self._resolve_single_dataloader(self._fallback_val_loader)
+        if val_loader is None:
+            raise RuntimeError(
+                'MUSDB debug visualizer enabled but validation dataloader is unavailable at fit start.'
+            )
+
+        val_dataset = getattr(val_loader, 'dataset', None)
+        if val_dataset is None or len(val_dataset) == 0:
+            raise RuntimeError(
+                'MUSDB debug visualizer enabled but validation dataset is empty.'
+            )
+
+        sample = self._extract_tensor(val_dataset[0]).detach().to(device)
+        if sample.dim() == 2:
+            sample = sample.unsqueeze(0)
+        elif sample.dim() != 3:
+            raise RuntimeError(
+                f'Unsupported MUSDB debug sample shape {tuple(sample.shape)}; expected [C, T] or [B, C, T].'
+            )
+
+        sample_rate = int(getattr(pl_module, 'sr', 0))
+        if sample_rate <= 0:
+            raise RuntimeError('MUSDB debug visualizer requires a positive model sample rate.')
+
+        target_samples = int(round(sample_rate * self.DEBUG_SECONDS))
+        if sample.shape[-1] < target_samples:
+            sample = F.pad(sample, (0, target_samples - sample.shape[-1]))
+        else:
+            sample = sample[..., :target_samples]
+
+        self._cached_sample = sample
+
+        try:
+            from musicsep_visualizer import VisualizationHook
+        except ImportError as err:
+            raise RuntimeError(
+                'MUSDB debug visualizer requested but musicsep-visualizer is not installed. '
+                'Install dependencies from requirements.txt.'
+            ) from err
+
+        self._viz_class = VisualizationHook
+        self._viz_hook = VisualizationHook('musdb_debug_output')
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if self._cached_sample is None or self._viz_hook is None:
+            return
+
+        if trainer.global_step <= 0 or trainer.global_step % self.debug_every:
+            return
+
+        was_training = pl_module.training
+        pl_module.eval()
+
+        try:
+            with torch.no_grad():
+                output = pl_module(self._cached_sample)
+                self._viz_hook(output)
+        finally:
+            if was_training:
+                pl_module.train()
+
+    def on_fit_end(self, trainer, pl_module) -> None:
+        if self._viz_hook is None or self._viz_class is None:
+            return
+
+        stop_visualization = getattr(self._viz_class, 'stop_visualization', None)
+        if callable(stop_visualization):
+            stop_visualization()
 
 def add_gin_extension(config_name: str) -> str:
     if config_name[-4:] != '.gin':
@@ -345,6 +457,18 @@ def main(argv):
 
     if FLAGS.ema is not None:
         callbacks.append(EMA(FLAGS.ema))
+
+    if FLAGS.debug_every > 0:
+        if FLAGS.dataset_format == 'musdb':
+            callbacks.append(MusdbDebugVisualizerCallback(FLAGS.debug_every, fallback_val_loader=val))
+            print(
+                f'MUSDB debug visualizer enabled: running every {FLAGS.debug_every} train steps.'
+            )
+        else:
+            print(
+                '[Warning] --debug_every is only supported with --dataset_format musdb. '
+                'Debug visualizer is disabled.'
+            )
 
     trainer = pl.Trainer(
         logger=get_logger(RUN_NAME),
