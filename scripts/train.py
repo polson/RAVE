@@ -4,7 +4,7 @@ import sys
 from typing import Any, Dict
 
 import gin
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 from absl import flags, app
 from torch.utils.data import DataLoader
@@ -257,11 +257,7 @@ def main(argv):
     run = rave.core.search_for_run(FLAGS.ckpt)
     if run is not None:
         print('loading state from file %s'%run)
-        loaded = torch.load(run, map_location='cpu')
-        # model = model.load_state_dict(loaded)
-        trainer.fit_loop.epoch_loop._batches_that_stepped = loaded['global_step']
-        # model = model.load_state_dict(loaded['state_dict'])
-    
+
     with open(os.path.join(FLAGS.out_path, RUN_NAME, "config.gin"), "w") as config_out:
         config_out.write(gin.operative_config_str())
 

@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from scipy.optimize import fmin
-from scipy.signal import firwin, kaiser, kaiser_beta, kaiserord
+from scipy.signal import firwin, kaiser_beta, kaiserord
+from scipy.signal.windows import kaiser
 
 
 def reverse_half(x):
@@ -66,7 +67,7 @@ def kaiser_filter(wc, atten, N=None):
     N_, beta = kaiserord(atten, wc / np.pi)
     N_ = 2 * (N_ // 2) + 1
     N = N if N is not None else N_
-    h = firwin(N, wc, window=('kaiser', beta), scale=False, nyq=np.pi)
+    h = firwin(N, wc, window=('kaiser', beta), scale=False, fs=2 * np.pi)
     return h
 
 

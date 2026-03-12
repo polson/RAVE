@@ -117,8 +117,8 @@ def main(argv):
             out = model.forward(x[None])
 
         # save file
-        out_path = re.sub(d, "", f)
-        out_path = os.path.join(FLAGS.out_path, f)
+        rel_path = re.sub(d, "", f)
+        out_path = os.path.join(out_path, rel_path)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         torchaudio.save(out_path, out[0].cpu(), sample_rate=model.sr)
 

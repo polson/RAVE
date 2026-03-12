@@ -31,6 +31,11 @@ def get_derivator_integrator(sr: int):
 
 class AudioDataset(data.Dataset):
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_env'] = None
+        return state
+
     @property
     def env(self) -> lmdb.Environment:
         if self._env is None:
@@ -84,6 +89,11 @@ class AudioDataset(data.Dataset):
 
 
 class LazyAudioDataset(data.Dataset):
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_env'] = None
+        return state
 
     @property
     def env(self) -> lmdb.Environment:
@@ -164,7 +174,7 @@ def get_training_channels(db_path, target_channels):
     dataset_channels = get_channels_from_dataset(db_path)
     if dataset_channels is not None:
         if target_channels > dataset_channels:
-            raise RuntimeError('[Error] Requested number of channels is %s, but dataset has %s channels')%(FLAGS.channels, dataset_channels)
+            raise RuntimeError('[Error] Requested number of channels is %s, but dataset has %s channels' % (target_channels, dataset_channels))
     n_channels = target_channels or dataset_channels
     if n_channels is None:
         print('[Warning] channels not found in dataset, taking 1 by default')

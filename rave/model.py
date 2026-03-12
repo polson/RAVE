@@ -4,12 +4,11 @@ from typing import Callable, Optional, Iterable, Dict
 
 import gin, pdb
 import numpy as np
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torch.nn as nn
 from einops import rearrange
 from sklearn.decomposition import PCA
-from pytorch_lightning.trainer.states import RunningStage
 
 
 import rave.core
@@ -222,6 +221,7 @@ class RAVE(pl.LightningModule):
 
         self.register_buffer("receptive_field", torch.tensor([0, 0]).long())
         self.audio_monitor_epochs = audio_monitor_epochs
+        self.validation_step_outputs = []
 
     def configure_optimizers(self):
         gen_p = list(self.encoder.parameters())
@@ -440,9 +440,11 @@ class RAVE(pl.LightningModule):
         if self.trainer is not None:
             self.log('validation', full_distance)
 
-        return torch.cat([x, y], -1), mean
+        output = (torch.cat([x, y], -1), mean)
+        self.validation_step_outputs.append(output)
+        return output
 
-    def validation_epoch_end(self, out):
+    def on_validation_epoch_end(self):
         if not self.receptive_field.sum():
             print("Computing receptive field for this configuration...")
             lrf, rrf = rave.core.get_rave_receptive_field(self, n_channels=self.n_channels)
@@ -452,12 +454,14 @@ class RAVE(pl.LightningModule):
                 f"Receptive field: {1000*lrf/self.sr:.2f}ms <-- x --> {1000*rrf/self.sr:.2f}ms"
             )
 
+        out = self.validation_step_outputs
         if not len(out): return
 
         audio, z = list(zip(*out))
         audio = list(map(lambda x: x.cpu(), audio))
 
-        if self.trainer.state.stage == RunningStage.SANITY_CHECKING:
+        if self.trainer is not None and self.trainer.sanity_checking:
+            self.validation_step_outputs.clear()
             return
 
         # LATENT SPACE ANALYSIS
@@ -493,6 +497,7 @@ class RAVE(pl.LightningModule):
         self.logger.experiment.add_audio("audio_val", y, self.eval_number,
                                         self.sr)
         self.eval_number += 1
+        self.validation_step_outputs.clear()
 
     def on_fit_start(self):
         tb = self.logger.experiment
@@ -508,4 +513,3 @@ class RAVE(pl.LightningModule):
         model = ['```'] + model + ['```']
         model = '\n'.join(model)
         tb.add_text("model", model)
-

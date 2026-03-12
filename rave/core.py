@@ -8,7 +8,7 @@ import GPUtil as gpu
 import librosa as li
 import lmdb
 import numpy as np
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torch.fft as fft
 import torch.nn as nn
@@ -558,4 +558,5 @@ def get_valid_extensions():
         return ['.'+f for f in torchaudio.utils.ffmpeg_utils.get_audio_decoders()]
     elif backend == "soundfile":
         return ['.wav', '.flac', '.ogg', '.aiff', '.aif', '.aifc']
-
+    else:
+        return ['.wav', '.flac', '.ogg', '.aiff', '.aif', '.aifc', '.mp3']

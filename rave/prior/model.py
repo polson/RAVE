@@ -2,7 +2,7 @@ import abc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import gin
 from tqdm import tqdm
 import math
@@ -68,6 +68,7 @@ class Prior(pl.LightningModule):
 
         self.n_channels = n_channels
         self.val_idx = 0
+        self.validation_step_outputs = []
         rf = (kernel_size - 1) * sum(2**(np.arange(n_layers) % cycle_size)) + 1
         if pretrained_vae is not None:
             ratio = self.get_model_ratio()
@@ -178,9 +179,14 @@ class Prior(pl.LightningModule):
         )
 
         self.log("validation", loss)
+        self.validation_step_outputs.append(batch)
         return batch
 
-    def validation_epoch_end(self, out):
+    def on_validation_epoch_end(self):
+        out = self.validation_step_outputs
+        if not out:
+            return
+
         x = torch.randn_like(self.encode(out[0]))
         x = self.quantized_normal.encode(self.diagonal_shift(x))
         z = self.generate(x)
@@ -194,6 +200,7 @@ class Prior(pl.LightningModule):
             self.synth.sr,
         )
         self.val_idx += 1
+        self.validation_step_outputs.clear()
 
     @abc.abstractmethod
     def post_process_latent(self, z):
