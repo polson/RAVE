@@ -4,7 +4,7 @@ import math
 import os
 import subprocess
 from random import random
-from typing import Callable, Dict, Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Union
 
 import gin
 import lmdb
@@ -174,7 +174,11 @@ class MusdbStemDataset(data.Dataset):
                  n_signal: int,
                  sampling_rate: int,
                  transforms: Optional[transforms.Transform] = None,
-                 n_channels: int = 1) -> None:
+                 n_channels: int = 1,
+                 strip_silence: bool = True,
+                 silence_threshold_db: float = -60.0,
+                 max_non_silent_tries: int = 8,
+                 min_active_fraction: float = 0.0) -> None:
         super().__init__()
         self._split_root = split_root
         self._stem_filename = stem_filename
@@ -182,6 +186,14 @@ class MusdbStemDataset(data.Dataset):
         self._sampling_rate = sampling_rate
         self._transforms = transforms
         self._n_channels = n_channels
+        self._strip_silence = bool(strip_silence)
+        self._silence_threshold_db = float(silence_threshold_db)
+        self._max_non_silent_tries = max(1, int(max_non_silent_tries))
+        self._min_active_fraction = max(0.0, float(min_active_fraction))
+
+        self._silence_retry_total = 0
+        self._silence_selection_count = 0
+        self._silence_fallback_count = 0
 
         self._files = []
         self._items = np.array([], dtype=np.int64)
@@ -243,12 +255,9 @@ class MusdbStemDataset(data.Dataset):
         channel_map = (math.ceil(self._n_channels / in_channels) * list(range(in_channels)))[:self._n_channels]
         return audio[channel_map]
 
-    def __getitem__(self, index):
-        audio_id = int(np.searchsorted(self._items, index, side='right'))
-        file_metadata = self._files[audio_id]
-
+    def _sample_file_chunk(self, file_metadata: Dict[str, Any]) -> torch.Tensor:
         chunk_size = self._n_signal * 2
-        max_offset = max(file_metadata["num_frames"] - chunk_size, 0)
+        max_offset = max(int(file_metadata["num_frames"]) - chunk_size, 0)
         offset = int(np.random.randint(0, max_offset + 1)) if max_offset > 0 else 0
 
         audio, _ = torchaudio.load(
@@ -257,25 +266,141 @@ class MusdbStemDataset(data.Dataset):
             num_frames=chunk_size,
         )
 
-        if file_metadata["sample_rate"] != self._sampling_rate:
+        source_sample_rate = int(file_metadata["sample_rate"])
+        if source_sample_rate != self._sampling_rate:
             audio = torchaudio.functional.resample(
                 audio,
-                file_metadata["sample_rate"],
+                source_sample_rate,
                 self._sampling_rate,
             )
 
-        audio = self._map_channels(audio, file_metadata["channels"])
+        audio = self._map_channels(audio, int(file_metadata["channels"]))
 
         if audio.shape[-1] < chunk_size:
             pad = chunk_size - audio.shape[-1]
             audio = torch.nn.functional.pad(audio, (0, pad))
+
+        return audio
+
+    def _sample_candidate(self,
+                          index: int,
+                          max_non_silent_tries: Optional[int] = None):
+        audio_id = int(np.searchsorted(self._items, index, side='right'))
+        tries = self._max_non_silent_tries
+        if max_non_silent_tries is not None:
+            tries = max(1, int(max_non_silent_tries))
+
+        best_audio = None
+        best_stats = None
+
+        for attempt in range(tries):
+            if attempt == 0:
+                file_metadata = self._files[audio_id]
+            else:
+                file_metadata = self._files[int(np.random.randint(0, len(self._files)))]
+
+            audio = self._sample_file_chunk(file_metadata)
+
+            if not self._strip_silence:
+                return audio, None, False, attempt + 1
+
+            non_silent, stats = is_chunk_non_silent(
+                audio,
+                silence_threshold_db=self._silence_threshold_db,
+                min_active_fraction=self._min_active_fraction,
+            )
+
+            if best_stats is None or stats['rms_dbfs'] > best_stats['rms_dbfs']:
+                best_audio = audio
+                best_stats = stats
+
+            if non_silent:
+                return audio, stats, False, attempt + 1
+
+        return best_audio, best_stats, True, tries
+
+    def sample_with_retry(self,
+                          index: Optional[int] = None,
+                          max_non_silent_tries: Optional[int] = None):
+        if index is None:
+            index = int(np.random.randint(0, len(self)))
+
+        audio, stats, exhausted_retries, attempts = self._sample_candidate(
+            index=index,
+            max_non_silent_tries=max_non_silent_tries,
+        )
+
+        if audio is None:
+            raise RuntimeError('Unable to sample MUSDB chunk.')
+
+        if self._strip_silence:
+            self._silence_selection_count += 1
+            self._silence_retry_total += max(0, attempts - 1)
+            if exhausted_retries:
+                self._silence_fallback_count += 1
+                should_log = self._silence_fallback_count <= 5 or self._silence_fallback_count % 100 == 0
+                if should_log and stats is not None:
+                    logging.warning(
+                        "MUSDB silence strip fallback after %s tries (threshold %.2f dBFS). "
+                        "Using best candidate: rms %.2f dBFS, active_fraction %.6f",
+                        attempts,
+                        self._silence_threshold_db,
+                        stats['rms_dbfs'],
+                        stats['active_fraction'],
+                    )
+
+            if self._silence_selection_count % 2000 == 0:
+                avg_retries = self._silence_retry_total / max(self._silence_selection_count, 1)
+                logging.info(
+                    "MUSDB silence strip stats: selections=%s, avg_retries=%.3f, fallbacks=%s",
+                    self._silence_selection_count,
+                    avg_retries,
+                    self._silence_fallback_count,
+                )
 
         audio = audio.numpy()
 
         if self._transforms is not None:
             audio = self._transforms(audio)
 
+        return audio, stats, exhausted_retries
+
+    def __getitem__(self, index):
+        audio, _, _ = self.sample_with_retry(index=index)
         return audio
+
+
+def get_chunk_activity(audio: Union[np.ndarray, torch.Tensor],
+                       silence_threshold_db: float = -60.0):
+    if isinstance(audio, np.ndarray):
+        tensor = torch.from_numpy(audio)
+    else:
+        tensor = audio
+
+    tensor = tensor.detach().to(dtype=torch.float32)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+
+    rms = torch.sqrt(torch.mean(tensor * tensor).clamp_min(1e-12))
+    rms_dbfs = float((20.0 * torch.log10(rms)).item())
+    threshold_amplitude = float(10.0**(silence_threshold_db / 20.0))
+    active_fraction = float((tensor.abs() >= threshold_amplitude).to(dtype=torch.float32).mean().item())
+
+    return {
+        'rms_dbfs': rms_dbfs,
+        'active_fraction': active_fraction,
+        'threshold_amplitude': threshold_amplitude,
+    }
+
+
+def is_chunk_non_silent(audio: Union[np.ndarray, torch.Tensor],
+                        silence_threshold_db: float = -60.0,
+                        min_active_fraction: float = 0.0):
+    stats = get_chunk_activity(audio, silence_threshold_db=silence_threshold_db)
+    non_silent = stats['rms_dbfs'] >= silence_threshold_db
+    if min_active_fraction > 0:
+        non_silent = non_silent and stats['active_fraction'] >= min_active_fraction
+    return non_silent, stats
 
 def get_channels_from_dataset(db_path):
     with open(os.path.join(db_path, 'metadata.yaml'), 'r') as metadata:
@@ -370,6 +495,10 @@ def get_dataset_pair(train_root,
                      sr,
                      n_signal,
                      stem_filename: str = 'vocals.wav',
+                     strip_silence: bool = True,
+                     silence_threshold_db: float = -60.0,
+                     max_non_silent_tries: int = 8,
+                     min_active_fraction: float = 0.0,
                      derivative: bool = False,
                      normalize: bool = False,
                      rand_pitch: Optional[Iterable[float]] = None,
@@ -392,6 +521,10 @@ def get_dataset_pair(train_root,
         sampling_rate=sr,
         transforms=transform_list,
         n_channels=n_channels,
+        strip_silence=strip_silence,
+        silence_threshold_db=silence_threshold_db,
+        max_non_silent_tries=max_non_silent_tries,
+        min_active_fraction=min_active_fraction,
     )
     val_dataset = MusdbStemDataset(
         split_root=val_root,
@@ -400,6 +533,10 @@ def get_dataset_pair(train_root,
         sampling_rate=sr,
         transforms=transform_list,
         n_channels=n_channels,
+        strip_silence=strip_silence,
+        silence_threshold_db=silence_threshold_db,
+        max_non_silent_tries=max_non_silent_tries,
+        min_active_fraction=min_active_fraction,
     )
     return train_dataset, val_dataset
 

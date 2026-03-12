@@ -109,6 +109,16 @@ rave train \
 
 You can also pass an explicit validation root with `--val_db_path`.
 
+MUSDB mode enables silence-aware chunk sampling by default to avoid training on empty segments:
+
+- `--musdb_strip_silence` (default: enabled)
+- `--musdb_silence_threshold_db` (default: `-60.0`)
+- `--musdb_max_non_silent_tries` (default: `8`)
+
+Sampler behavior is retry-with-fallback: when no chunk passes the threshold after the configured retries, RAVE logs a warning and keeps the best available chunk so training does not stall.
+
+When using `--debug_every` with `--dataset_format musdb`, the debug visualizer now uses the same non-silent selection policy to cache a representative validation sample.
+
 Many other configuration files are available in `rave/configs` and can be combined. Here is a list of all the available configurations & augmentations :
 
 <table>
@@ -251,6 +261,12 @@ rave train_prior \
   --musdb_stem vocals.wav \
   --out_path /path/to/output
 ```
+
+The same MUSDB silence-aware flags are available in `rave train_prior`:
+
+- `--musdb_strip_silence`
+- `--musdb_silence_threshold_db`
+- `--musdb_max_non_silent_tries`
 
 this will train a prior over the latent of the pretrained model `path/to/your/run`, and save the model and tensorboard logs to folder `/path/to/output`.
 

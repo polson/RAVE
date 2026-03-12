@@ -38,6 +38,21 @@ flags.DEFINE_string('val_db_path',
 flags.DEFINE_string('musdb_stem',
                     'vocals.wav',
                     help='Stem filename used in MUSDB mode')
+flags.DEFINE_bool(
+    'musdb_strip_silence',
+    True,
+    help='MUSDB only: retry chunk sampling to avoid silent chunks',
+)
+flags.DEFINE_float(
+    'musdb_silence_threshold_db',
+    -60.0,
+    help='MUSDB only: silence threshold in dBFS',
+)
+flags.DEFINE_integer(
+    'musdb_max_non_silent_tries',
+    8,
+    help='MUSDB only: max retries to find a non-silent chunk',
+)
 flags.DEFINE_string('out_path', default="runs/", help="out directory path")
 flags.DEFINE_multi_integer('gpu', default=None, help='GPU to use')
 flags.DEFINE_integer('batch', 8, help="batch size")
@@ -191,6 +206,9 @@ def main(argv):
             sr=pretrained.sr,
             n_signal=n_signal,
             stem_filename=FLAGS.musdb_stem,
+            strip_silence=FLAGS.musdb_strip_silence,
+            silence_threshold_db=FLAGS.musdb_silence_threshold_db,
+            max_non_silent_tries=FLAGS.musdb_max_non_silent_tries,
             derivative=FLAGS.derivative,
             normalize=FLAGS.normalize,
             rand_pitch=FLAGS.rand_pitch,

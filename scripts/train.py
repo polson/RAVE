@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import sys
 from typing import Any, Dict, Optional
@@ -47,6 +48,21 @@ flags.DEFINE_string('val_db_path',
 flags.DEFINE_string('musdb_stem',
                     'vocals.wav',
                     help='Stem filename used in MUSDB mode')
+flags.DEFINE_bool(
+    'musdb_strip_silence',
+    True,
+    help='MUSDB only: retry chunk sampling to avoid silent chunks',
+)
+flags.DEFINE_float(
+    'musdb_silence_threshold_db',
+    -60.0,
+    help='MUSDB only: silence threshold in dBFS',
+)
+flags.DEFINE_integer(
+    'musdb_max_non_silent_tries',
+    8,
+    help='MUSDB only: max retries to find a non-silent chunk',
+)
 flags.DEFINE_string('out_path',
                      default="runs/",
                      help='Output folder')
@@ -153,10 +169,18 @@ class MusdbDebugVisualizerCallback(pl.Callback):
 
     DEBUG_SECONDS = 3.0
 
-    def __init__(self, debug_every: int, fallback_val_loader: Optional[DataLoader] = None) -> None:
+    def __init__(self,
+                 debug_every: int,
+                 fallback_val_loader: Optional[DataLoader] = None,
+                 strip_silence: bool = True,
+                 silence_threshold_db: float = -60.0,
+                 max_non_silent_tries: int = 8) -> None:
         super().__init__()
         self.debug_every = debug_every
         self._fallback_val_loader = fallback_val_loader
+        self._strip_silence = bool(strip_silence)
+        self._silence_threshold_db = float(silence_threshold_db)
+        self._max_non_silent_tries = max(1, int(max_non_silent_tries))
         self._cached_sample: Optional[torch.Tensor] = None
         self._viz_hook = None
         self._viz_class = None
@@ -174,6 +198,79 @@ class MusdbDebugVisualizerCallback(pl.Callback):
                 return None
             return dataloaders[0]
         return dataloaders
+
+    @staticmethod
+    def _match_time_length(x: torch.Tensor, target_length: int) -> torch.Tensor:
+        current_length = x.shape[-1]
+        if current_length > target_length:
+            return x[..., :target_length]
+        if current_length < target_length:
+            return F.pad(x, (0, target_length - current_length))
+        return x
+
+    @staticmethod
+    def _prepare_sample_shape(sample: torch.Tensor) -> torch.Tensor:
+        if sample.dim() == 3:
+            sample = sample[0]
+        if sample.dim() != 2:
+            raise RuntimeError(
+                f'Unsupported MUSDB debug sample shape {tuple(sample.shape)}; expected [C, T] or [B, C, T].'
+            )
+        return sample
+
+    def _select_debug_sample(self, val_dataset):
+        if hasattr(val_dataset, 'sample_with_retry'):
+            sample, stats, exhausted = val_dataset.sample_with_retry(
+                index=0,
+                max_non_silent_tries=self._max_non_silent_tries,
+            )
+            sample = self._prepare_sample_shape(self._extract_tensor(sample).detach())
+            return sample, stats, exhausted
+
+        tries = self._max_non_silent_tries
+        best_sample = None
+        best_stats = None
+
+        for _ in range(tries):
+            index = int(torch.randint(0, len(val_dataset), (1,)).item())
+            sample = self._prepare_sample_shape(self._extract_tensor(val_dataset[index]).detach())
+
+            if not self._strip_silence:
+                return sample, None, False
+
+            non_silent, stats = rave.dataset.is_chunk_non_silent(
+                sample,
+                silence_threshold_db=self._silence_threshold_db,
+            )
+            if best_stats is None or stats['rms_dbfs'] > best_stats['rms_dbfs']:
+                best_sample = sample
+                best_stats = stats
+
+            if non_silent:
+                return sample, stats, False
+
+        return best_sample, best_stats, True
+
+    @staticmethod
+    def _deterministic_latent(pl_module, z: torch.Tensor) -> torch.Tensor:
+        encoder = getattr(pl_module, 'encoder', None)
+        if encoder is None:
+            return z
+
+        if isinstance(encoder, rave.blocks.VariationalEncoder):
+            mean, _ = z.chunk(2, 1)
+            return mean
+
+        if isinstance(encoder, rave.blocks.WasserteinEncoder) and getattr(
+            encoder, 'noise_augmentation', 0
+        ):
+            return z
+
+        reparametrize = getattr(encoder, 'reparametrize', None)
+        if callable(reparametrize):
+            return reparametrize(z)[0]
+
+        return z
 
     def on_fit_start(self, trainer, pl_module) -> None:
         device = getattr(getattr(trainer, 'strategy', None), 'root_device', pl_module.device)
@@ -197,23 +294,38 @@ class MusdbDebugVisualizerCallback(pl.Callback):
                 'MUSDB debug visualizer enabled but validation dataset is empty.'
             )
 
-        sample = self._extract_tensor(val_dataset[0]).detach().to(device)
+        sample, stats, exhausted = self._select_debug_sample(val_dataset)
+        if sample is None:
+            raise RuntimeError('MUSDB debug visualizer could not sample validation audio.')
+
+        if exhausted and self._strip_silence:
+            if stats is not None:
+                logging.warning(
+                    'MUSDB debug visualizer fallback after %s tries. '
+                    'Using best candidate: rms %.2f dBFS, active_fraction %.6f',
+                    self._max_non_silent_tries,
+                    stats['rms_dbfs'],
+                    stats['active_fraction'],
+                )
+            else:
+                logging.warning(
+                    'MUSDB debug visualizer fallback after %s tries. Using best available sample.',
+                    self._max_non_silent_tries,
+                )
+
+        sample = sample.to(device)
         if sample.dim() == 2:
             sample = sample.unsqueeze(0)
-        elif sample.dim() != 3:
-            raise RuntimeError(
-                f'Unsupported MUSDB debug sample shape {tuple(sample.shape)}; expected [C, T] or [B, C, T].'
-            )
+
+        if sample.shape[0] != 1:
+            sample = sample[:1]
 
         sample_rate = int(getattr(pl_module, 'sr', 0))
         if sample_rate <= 0:
             raise RuntimeError('MUSDB debug visualizer requires a positive model sample rate.')
 
         target_samples = int(round(sample_rate * self.DEBUG_SECONDS))
-        if sample.shape[-1] < target_samples:
-            sample = F.pad(sample, (0, target_samples - sample.shape[-1]))
-        else:
-            sample = sample[..., :target_samples]
+        sample = self._match_time_length(sample, target_samples)
 
         self._cached_sample = sample
 
@@ -240,8 +352,13 @@ class MusdbDebugVisualizerCallback(pl.Callback):
 
         try:
             with torch.no_grad():
-                output = pl_module(self._cached_sample)
-                self._viz_hook(output)
+                z = pl_module.encode(self._cached_sample, return_mb=False)
+                z = self._deterministic_latent(pl_module, z)
+                output = pl_module.decode(z)
+                output = self._match_time_length(output, self._cached_sample.shape[-1])
+
+                viz_output = output[0] if output.dim() == 3 and output.shape[0] == 1 else output
+                self._viz_hook(viz_output)
         finally:
             if was_training:
                 pl_module.train()
@@ -382,6 +499,9 @@ def main(argv):
             sr=model.sr,
             n_signal=FLAGS.n_signal,
             stem_filename=FLAGS.musdb_stem,
+            strip_silence=FLAGS.musdb_strip_silence,
+            silence_threshold_db=FLAGS.musdb_silence_threshold_db,
+            max_non_silent_tries=FLAGS.musdb_max_non_silent_tries,
             derivative=FLAGS.derivative,
             normalize=FLAGS.normalize,
             rand_pitch=FLAGS.rand_pitch,
@@ -460,7 +580,14 @@ def main(argv):
 
     if FLAGS.debug_every > 0:
         if FLAGS.dataset_format == 'musdb':
-            callbacks.append(MusdbDebugVisualizerCallback(FLAGS.debug_every, fallback_val_loader=val))
+            callbacks.append(
+                MusdbDebugVisualizerCallback(
+                    FLAGS.debug_every,
+                    fallback_val_loader=val,
+                    strip_silence=FLAGS.musdb_strip_silence,
+                    silence_threshold_db=FLAGS.musdb_silence_threshold_db,
+                    max_non_silent_tries=FLAGS.musdb_max_non_silent_tries,
+                ))
             print(
                 f'MUSDB debug visualizer enabled: running every {FLAGS.debug_every} train steps.'
             )
