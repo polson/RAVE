@@ -4,7 +4,7 @@ import math
 import os
 import subprocess
 from random import random
-from typing import Dict, Iterable, Optional, Sequence, Union, Callable
+from typing import Callable, Dict, Iterable, Optional, Sequence, Union
 
 import gin
 import lmdb
@@ -165,6 +165,118 @@ class LazyAudioDataset(data.Dataset):
 
         return audio
 
+
+class MusdbStemDataset(data.Dataset):
+
+    def __init__(self,
+                 split_root: str,
+                 stem_filename: str,
+                 n_signal: int,
+                 sampling_rate: int,
+                 transforms: Optional[transforms.Transform] = None,
+                 n_channels: int = 1) -> None:
+        super().__init__()
+        self._split_root = split_root
+        self._stem_filename = stem_filename
+        self._n_signal = n_signal
+        self._sampling_rate = sampling_rate
+        self._transforms = transforms
+        self._n_channels = n_channels
+
+        self._files = []
+        self._items = np.array([], dtype=np.int64)
+        self.parse_dataset()
+
+    def parse_dataset(self):
+        if not os.path.isdir(self._split_root):
+            raise RuntimeError(f"Dataset split root does not exist: {self._split_root}")
+
+        files = []
+        for root, _, names in os.walk(self._split_root):
+            if self._stem_filename not in names:
+                continue
+
+            path = os.path.join(root, self._stem_filename)
+            try:
+                info = torchaudio.info(path)
+            except Exception as err:
+                logging.warning("Skipping unreadable stem file %s (%s)", path, err)
+                continue
+
+            if info.num_frames <= 0:
+                logging.warning("Skipping empty stem file %s", path)
+                continue
+
+            n_frames_target_sr = int(info.num_frames * self._sampling_rate / info.sample_rate)
+            n_chunks = max(n_frames_target_sr // self._n_signal, 1)
+            files.append({
+                "path": path,
+                "num_frames": int(info.num_frames),
+                "sample_rate": int(info.sample_rate),
+                "channels": int(info.num_channels),
+                "n_chunks": int(n_chunks),
+            })
+
+        if not files:
+            raise RuntimeError(
+                f"No '{self._stem_filename}' files found under {self._split_root}")
+
+        self._files = files
+        self._items = np.cumsum(np.asarray([f["n_chunks"] for f in files], dtype=np.int64))
+        logging.info(
+            "Discovered %s '%s' files in %s",
+            len(self._files),
+            self._stem_filename,
+            self._split_root,
+        )
+
+    def __len__(self):
+        return int(self._items[-1])
+
+    def _map_channels(self, audio: torch.Tensor, in_channels: int):
+        if in_channels == self._n_channels:
+            return audio
+
+        if in_channels > self._n_channels:
+            return audio[:self._n_channels]
+
+        channel_map = (math.ceil(self._n_channels / in_channels) * list(range(in_channels)))[:self._n_channels]
+        return audio[channel_map]
+
+    def __getitem__(self, index):
+        audio_id = int(np.searchsorted(self._items, index, side='right'))
+        file_metadata = self._files[audio_id]
+
+        chunk_size = self._n_signal * 2
+        max_offset = max(file_metadata["num_frames"] - chunk_size, 0)
+        offset = int(np.random.randint(0, max_offset + 1)) if max_offset > 0 else 0
+
+        audio, _ = torchaudio.load(
+            file_metadata["path"],
+            frame_offset=offset,
+            num_frames=chunk_size,
+        )
+
+        if file_metadata["sample_rate"] != self._sampling_rate:
+            audio = torchaudio.functional.resample(
+                audio,
+                file_metadata["sample_rate"],
+                self._sampling_rate,
+            )
+
+        audio = self._map_channels(audio, file_metadata["channels"])
+
+        if audio.shape[-1] < chunk_size:
+            pad = chunk_size - audio.shape[-1]
+            audio = torch.nn.functional.pad(audio, (0, pad))
+
+        audio = audio.numpy()
+
+        if self._transforms is not None:
+            audio = self._transforms(audio)
+
+        return audio
+
 def get_channels_from_dataset(db_path):
     with open(os.path.join(db_path, 'metadata.yaml'), 'r') as metadata:
         metadata = yaml.safe_load(metadata)
@@ -213,23 +325,14 @@ def normalize_signal(x: np.ndarray, max_gain_db: int = 30):
 
     return x * gain
 
-@gin.configurable
-def get_dataset(db_path,
-                sr,
-                n_signal,
-                derivative: bool = False,
-                normalize: bool = False,
-                rand_pitch: bool = False,
-                augmentations: Union[None, Iterable[Callable]] = None, 
-                n_channels: int = 1):
-    if db_path[:4] == "http":
-        return HTTPAudioDataset(db_path=db_path)
-    with open(os.path.join(db_path, 'metadata.yaml'), 'r') as metadata:
-        metadata = yaml.safe_load(metadata)
 
-    sr_dataset = metadata.get('sr', 44100)
-    lazy = metadata['lazy']
-
+def build_training_transforms(sr_dataset,
+                              sr,
+                              n_signal,
+                              derivative: bool = False,
+                              normalize: bool = False,
+                              rand_pitch: Optional[Iterable[float]] = None,
+                              augmentations: Union[None, Iterable[Callable]] = None):
     transform_list = [
         lambda x: x.astype(np.float32),
         transforms.RandomCrop(n_signal),
@@ -258,8 +361,74 @@ def get_dataset(db_path,
         transform_list.extend(augmentations)
 
     transform_list.append(lambda x: x.astype(np.float32))
+    return transforms.Compose(transform_list)
 
-    transform_list = transforms.Compose(transform_list)
+
+@gin.configurable
+def get_dataset_pair(train_root,
+                     val_root,
+                     sr,
+                     n_signal,
+                     stem_filename: str = 'vocals.wav',
+                     derivative: bool = False,
+                     normalize: bool = False,
+                     rand_pitch: Optional[Iterable[float]] = None,
+                     augmentations: Union[None, Iterable[Callable]] = None,
+                     n_channels: int = 1):
+    transform_list = build_training_transforms(
+        sr_dataset=sr,
+        sr=sr,
+        n_signal=n_signal,
+        derivative=derivative,
+        normalize=normalize,
+        rand_pitch=rand_pitch,
+        augmentations=augmentations,
+    )
+
+    train_dataset = MusdbStemDataset(
+        split_root=train_root,
+        stem_filename=stem_filename,
+        n_signal=n_signal,
+        sampling_rate=sr,
+        transforms=transform_list,
+        n_channels=n_channels,
+    )
+    val_dataset = MusdbStemDataset(
+        split_root=val_root,
+        stem_filename=stem_filename,
+        n_signal=n_signal,
+        sampling_rate=sr,
+        transforms=transform_list,
+        n_channels=n_channels,
+    )
+    return train_dataset, val_dataset
+
+@gin.configurable
+def get_dataset(db_path,
+                sr,
+                n_signal,
+                derivative: bool = False,
+                normalize: bool = False,
+                rand_pitch: Optional[Iterable[float]] = None,
+                augmentations: Union[None, Iterable[Callable]] = None, 
+                n_channels: int = 1):
+    if db_path[:4] == "http":
+        return HTTPAudioDataset(db_path=db_path)
+    with open(os.path.join(db_path, 'metadata.yaml'), 'r') as metadata:
+        metadata = yaml.safe_load(metadata)
+
+    sr_dataset = metadata.get('sr', 44100)
+    lazy = metadata['lazy']
+
+    transform_list = build_training_transforms(
+        sr_dataset=sr_dataset,
+        sr=sr,
+        n_signal=n_signal,
+        derivative=derivative,
+        normalize=normalize,
+        rand_pitch=rand_pitch,
+        augmentations=augmentations,
+    )
 
     if lazy:
         return LazyAudioDataset(db_path, n_signal, sr_dataset, transform_list, n_channels)

@@ -86,6 +86,29 @@ New in 2.3, data augmentations are also available to improve the model's general
 rave train --config v2 --augment mute --augment compress
 ```
 
+#### Direct MUSDB training (no preprocessing)
+
+You can train directly from a MUSDB-style folder tree without running `rave preprocess`.
+In this mode, RAVE expects:
+
+- `train/` for training
+- `test/` for validation
+- one stem file per track folder (default: `vocals.wav`)
+
+Example using `/home/phil/Audiosep/Datasets/combined`:
+
+```bash
+rave train \
+  --dataset_format musdb \
+  --db_path /home/phil/Audiosep/Datasets/combined \
+  --musdb_stem vocals.wav \
+  --config v2 \
+  --name musdb_vocals \
+  --out_path /path/to/output
+```
+
+You can also pass an explicit validation root with `--val_db_path`.
+
 Many other configuration files are available in `rave/configs` and can be combined. Here is a list of all the available configurations & augmentations :
 
 <table>
@@ -216,6 +239,17 @@ To train a prior for a pretrained RAVE model :
 
 ```bash
 rave train_prior --model /path/to/your/run --db_path /path/to/your_preprocessed_data --out_path /path/to/output
+```
+
+`train_prior` also supports direct MUSDB loading with the same split logic (`train/` for training, `test/` for validation):
+
+```bash
+rave train_prior \
+  --model /path/to/your/run \
+  --dataset_format musdb \
+  --db_path /home/phil/Audiosep/Datasets/combined \
+  --musdb_stem vocals.wav \
+  --out_path /path/to/output
 ```
 
 this will train a prior over the latent of the pretrained model `path/to/your/run`, and save the model and tensorboard logs to folder `/path/to/output`.

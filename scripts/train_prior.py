@@ -24,7 +24,20 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('name', None, help='Name of the run')
 flags.DEFINE_string('model', default=None, required=True, help="pretrained RAVE path")
 flags.DEFINE_multi_string('config', default="prior/prior_v1.gin", help="config path")
-flags.DEFINE_string('db_path', default=None, required=True, help="Preprocessed dataset path")
+flags.DEFINE_string('db_path',
+                    default=None,
+                    required=True,
+                    help="Dataset path (LMDB root or MUSDB root)")
+flags.DEFINE_enum('dataset_format',
+                  'lmdb',
+                  ['lmdb', 'musdb'],
+                  help='Dataset format: preprocessed LMDB or direct MUSDB stems')
+flags.DEFINE_string('val_db_path',
+                    None,
+                    help='Optional explicit validation dataset root')
+flags.DEFINE_string('musdb_stem',
+                    'vocals.wav',
+                    help='Stem filename used in MUSDB mode')
 flags.DEFINE_string('out_path', default="runs/", help="out directory path")
 flags.DEFINE_multi_integer('gpu', default=None, help='GPU to use')
 flags.DEFINE_integer('batch', 8, help="batch size")
@@ -60,6 +73,21 @@ def add_gin_extension(config_name: str) -> str:
     if config_name[-4:] != '.gin':
         config_name += '.gin'
     return config_name
+
+
+def resolve_musdb_roots(db_path: str, val_db_path: str | None):
+    if val_db_path:
+        train_root = db_path
+        val_root = val_db_path
+    else:
+        train_root = os.path.join(db_path, 'train')
+        val_root = os.path.join(db_path, 'test')
+
+    if not os.path.isdir(train_root):
+        raise RuntimeError(f"MUSDB train root does not exist: {train_root}")
+    if not os.path.isdir(val_root):
+        raise RuntimeError(f"MUSDB val root does not exist: {val_root}")
+    return train_root, val_root
 
 
 def main(argv):
@@ -107,15 +135,31 @@ def main(argv):
     else:
         raise NotImplementedError("prior not implemented for encoder of type %s"%(type(pretrained.encoder)))
 
-    dataset = rave.dataset.get_dataset(FLAGS.db_path,
-                                       pretrained.sr,
-                                       max(FLAGS.n_signal, prior.min_receptive_field),
-                                       derivative=FLAGS.derivative,
-                                       normalize=FLAGS.normalize,
-                                       rand_pitch=FLAGS.rand_pitch,
-                                       n_channels=pretrained.n_channels)
-
-    train, val = rave.dataset.split_dataset(dataset, 98)
+    n_signal = max(FLAGS.n_signal, prior.min_receptive_field)
+    if FLAGS.dataset_format == 'lmdb':
+        dataset = rave.dataset.get_dataset(FLAGS.db_path,
+                                           pretrained.sr,
+                                           n_signal,
+                                           derivative=FLAGS.derivative,
+                                           normalize=FLAGS.normalize,
+                                           rand_pitch=FLAGS.rand_pitch,
+                                           n_channels=pretrained.n_channels)
+        train, val = rave.dataset.split_dataset(dataset, 98)
+    else:
+        train_root, val_root = resolve_musdb_roots(FLAGS.db_path, FLAGS.val_db_path)
+        print(f'MUSDB train root: {train_root}')
+        print(f'MUSDB val root: {val_root}')
+        train, val = rave.dataset.get_dataset_pair(
+            train_root=train_root,
+            val_root=val_root,
+            sr=pretrained.sr,
+            n_signal=n_signal,
+            stem_filename=FLAGS.musdb_stem,
+            derivative=FLAGS.derivative,
+            normalize=FLAGS.normalize,
+            rand_pitch=FLAGS.rand_pitch,
+            n_channels=pretrained.n_channels,
+        )
 
     # get data-loader
     num_workers = FLAGS.workers

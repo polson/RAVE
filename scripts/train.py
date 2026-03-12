@@ -6,6 +6,7 @@ from typing import Any, Dict
 import gin
 import lightning.pytorch as pl
 import torch
+import torchaudio
 from absl import flags, app
 from torch.utils.data import DataLoader
 
@@ -33,11 +34,21 @@ flags.DEFINE_multi_string('augment',
                             help = 'augmentation configurations to use')
 flags.DEFINE_string('db_path',
                     None,
-                    help='Preprocessed dataset path',
+                    help='Dataset path (LMDB root or MUSDB root)',
                     required=True)
+flags.DEFINE_enum('dataset_format',
+                  'lmdb',
+                  ['lmdb', 'musdb'],
+                  help='Dataset format: preprocessed LMDB or direct MUSDB stems')
+flags.DEFINE_string('val_db_path',
+                    None,
+                    help='Optional explicit validation dataset root')
+flags.DEFINE_string('musdb_stem',
+                    'vocals.wav',
+                    help='Stem filename used in MUSDB mode')
 flags.DEFINE_string('out_path',
-                    default="runs/",
-                    help='Output folder')
+                     default="runs/",
+                     help='Output folder')
 flags.DEFINE_integer('max_steps',
                      6000000,
                      help='Maximum number of training steps')
@@ -131,17 +142,63 @@ def parse_augmentations(augmentations):
         gin.clear_config()
     return get_augmentations()
 
+
+def resolve_musdb_roots(db_path: str, val_db_path: str | None):
+    if val_db_path:
+        train_root = db_path
+        val_root = val_db_path
+    else:
+        train_root = os.path.join(db_path, 'train')
+        val_root = os.path.join(db_path, 'test')
+
+    if not os.path.isdir(train_root):
+        raise RuntimeError(f"MUSDB train root does not exist: {train_root}")
+    if not os.path.isdir(val_root):
+        raise RuntimeError(f"MUSDB val root does not exist: {val_root}")
+    return train_root, val_root
+
+
+def infer_musdb_channels(split_root: str, stem_filename: str, target_channels: int):
+    if target_channels > 0:
+        return target_channels
+
+    for root, _, names in os.walk(split_root):
+        if stem_filename not in names:
+            continue
+
+        path = os.path.join(root, stem_filename)
+        try:
+            info = torchaudio.info(path)
+        except Exception:
+            continue
+
+        if info.num_channels and info.num_channels > 0:
+            return int(info.num_channels)
+
+    print(
+        f"[Warning] could not infer channels from {split_root} with stem '{stem_filename}', taking 1 by default"
+    )
+    return 1
+
 def main(argv):
     torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.benchmark = True
 
     # check dataset channels
-    n_channels = rave.dataset.get_training_channels(FLAGS.db_path, FLAGS.channels)
+    if FLAGS.dataset_format == 'lmdb':
+        n_channels = rave.dataset.get_training_channels(FLAGS.db_path, FLAGS.channels)
+    else:
+        train_root, val_root = resolve_musdb_roots(FLAGS.db_path, FLAGS.val_db_path)
+        n_channels = infer_musdb_channels(train_root, FLAGS.musdb_stem, FLAGS.channels)
+        print(f'MUSDB train root: {train_root}')
+        print(f'MUSDB val root: {val_root}')
+
     gin.bind_parameter('RAVE.n_channels', n_channels)
 
     # parse augmentations
     augmentations = parse_augmentations(map(add_gin_extension, FLAGS.augment))
     gin.bind_parameter('dataset.get_dataset.augmentations', augmentations)
+    gin.bind_parameter('dataset.get_dataset_pair.augmentations', augmentations)
 
     # parse configuration
     if FLAGS.ckpt:
@@ -156,19 +213,33 @@ def main(argv):
         )
 
     # create model
-    model = rave.RAVE(n_channels=FLAGS.channels)
+    model = rave.RAVE(n_channels=n_channels)
     if FLAGS.derivative:
         model.integrator = rave.dataset.get_derivator_integrator(model.sr)[1]
 
     # parse datasset
-    dataset = rave.dataset.get_dataset(FLAGS.db_path,
-                                       model.sr,
-                                       FLAGS.n_signal,
-                                       derivative=FLAGS.derivative,
-                                       normalize=FLAGS.normalize,
-                                       rand_pitch=FLAGS.rand_pitch,
-                                       n_channels=n_channels)
-    train, val = rave.dataset.split_dataset(dataset, 98)
+    if FLAGS.dataset_format == 'lmdb':
+        dataset = rave.dataset.get_dataset(FLAGS.db_path,
+                                           model.sr,
+                                           FLAGS.n_signal,
+                                           derivative=FLAGS.derivative,
+                                           normalize=FLAGS.normalize,
+                                           rand_pitch=FLAGS.rand_pitch,
+                                           n_channels=n_channels)
+        train, val = rave.dataset.split_dataset(dataset, 98)
+    else:
+        train, val = rave.dataset.get_dataset_pair(
+            train_root=train_root,
+            val_root=val_root,
+            sr=model.sr,
+            n_signal=FLAGS.n_signal,
+            stem_filename=FLAGS.musdb_stem,
+            derivative=FLAGS.derivative,
+            normalize=FLAGS.normalize,
+            rand_pitch=FLAGS.rand_pitch,
+            augmentations=augmentations,
+            n_channels=n_channels,
+        )
 
     # get data-loader
     num_workers = FLAGS.workers
